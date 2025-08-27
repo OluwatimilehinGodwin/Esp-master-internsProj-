@@ -2,7 +2,7 @@
 #include <esp_now.h>
 #include <WiFi.h>
 
-// Receiver MAC address (replace with your CYD ESP32's MAC)
+// Receiver MAC address
 uint8_t receiverMAC[] = {0x78, 0xEE, 0x4C, 0x02, 0x17, 0x54};
 
 // ESP-NOW send callback

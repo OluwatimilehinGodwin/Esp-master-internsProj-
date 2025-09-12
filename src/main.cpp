@@ -3,6 +3,7 @@
  * - WiFi + NTP (WAT, UTC+1)
  * - Supabase REST calls with caching
  * - ESP-NOW for display communication
+ * - UART communication support
  */
 
 #include <Arduino.h>
@@ -17,7 +18,7 @@
 #include <vector>
 
 // ---------------------- USER CONFIG ----------------------
-//display/slave MAC (6 bytes)
+// Replace with your display/slave MAC (6 bytes)
 uint8_t receiverMAC[] = {0x78, 0xEE, 0x4C, 0x02, 0x17, 0x54};
 
 // WiFi
@@ -29,7 +30,7 @@ const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 3600;   // +1 hour
 const int   daylightOffset_sec = 0; // none
 
-// Supabase
+// Supabase (replace with your values)
 const char* supabase_url    = "https://cskdjbpsiupasdhynazt.supabase.co";
 const char* supabase_apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNza2RqYnBzaXVwYXNkaHluYXp0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTI3NDM2MTIsImV4cCI6MjA2ODMxOTYxMn0.n5V-Jl2njI3AdzWuXcFjFjqCdD4xdqUf7OCcfEA8Ahg";
 
@@ -37,11 +38,19 @@ const char* supabase_apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJz
 #define FP_RX 16
 #define FP_TX 17
 
+// UART Communication pins (UART2). Adjust if needed.
+#define UART_RX 18
+#define UART_TX 19
+#define UART_BAUD_RATE 115200
+
 // Buzzer pin (optional)
 #define BUZZER_PIN 13
 
 // ESP-NOW send interval for main heartbeat/time update
 const unsigned long sendInterval = 7000; // 7 seconds
+
+// Communication mode: 0 = ESP-NOW only, 1 = UART only, 2 = Both
+#define COMM_MODE 2
 
 // ---------------------------------------------------------
 
@@ -52,6 +61,9 @@ HTTPClient http;
 // Fingerprint
 HardwareSerial fpSerial(1);
 Adafruit_Fingerprint finger(&fpSerial);
+
+// UART Communication
+HardwareSerial uartSerial(2);
 
 // State
 bool wifiConnected = false;
@@ -71,13 +83,13 @@ const unsigned long fpCheckInterval = 100; // Check every 100ms
 // Collection cache
 std::vector<int> collectedToday;
 unsigned long lastCollectionRefresh = 0;
-const unsigned long collectionRefreshInterval = 120000; // Refresh every 2 min
+const unsigned long collectionRefreshInterval = 60000; // Refresh every 60 seconds
 
 // Timing variables
 unsigned long lastControlPoll = 0;
 const unsigned long controlPollInterval = 5000; // Poll every 5 seconds
 unsigned long lastWifiAttempt = 0;
-const unsigned long wifiReconnectInterval = 30000; // Try reconnect every 30 sec
+const unsigned long wifiReconnectInterval = 30000; // Try reconnect every 30 seconds
 
 // ---------- Forward declarations ----------
 void initWiFi();
@@ -89,6 +101,7 @@ bool initializeESP_NOW();
 void sendInstruction(const char* instruction);
 void sendInstructionWithTime(const char* instruction);
 void onSent(const uint8_t *mac_addr, esp_now_send_status_t status);
+void sendViaUART(const char* instruction, bool withTime = true);
 
 String checkControlMode();
 void updateControlModeToCollection();
@@ -113,6 +126,20 @@ void handleNetworkOperations(unsigned long now);
 void onSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   Serial.print("ESP-NOW Send Status: ");
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+// ------------------ UART Communication --------------------
+void sendViaUART(const char* instruction, bool withTime) {
+  String message;
+  if (withTime) {
+    String t = hhmmNow();
+    message = String(instruction) + "|" + t;
+  } else {
+    message = String(instruction);
+  }
+  
+  uartSerial.println(message);
+  Serial.printf("UART Sent: %s\n", message.c_str());
 }
 
 // ------------------ Time helpers ------------------------
@@ -230,15 +257,24 @@ void sendInstructionWithTime(const char* instruction) {
   String t = hhmmNow();
   char msg[64];
   snprintf(msg, sizeof(msg), "%s|%s", instruction, t.c_str());
-  // send
+  
+  // Send via selected communication method
+  #if COMM_MODE == 0 || COMM_MODE == 2
+  // ESP-NOW
   if (!espNowInitialized) {
     initializeESP_NOW();
   }
   esp_err_t r = esp_now_send(receiverMAC, (uint8_t*)msg, strlen(msg));
-  Serial.printf("Sent: %s\n", msg);
+  Serial.printf("ESP-NOW Sent: %s\n", msg);
   if (r != ESP_OK) {
     Serial.printf("esp_now_send error: 0x%X\n", r);
   }
+  #endif
+  
+  #if COMM_MODE == 1 || COMM_MODE == 2
+  // UART
+  sendViaUART(instruction);
+  #endif
 }
 
 void sendInstruction(const char* instruction) {
@@ -542,7 +578,6 @@ void processFingerprint() {
     Serial.printf("image2Tz error: %u\n", p);
     errorBeep();
     sendInstruction("unsuccessful");
-    
     fpState = COMPLETE;
     return;
   }
@@ -679,7 +714,7 @@ void errorBeep() {
 
 // ------------------ Setup & Loop ------------------------
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   delay(100);
 
   pinMode(BUZZER_PIN, OUTPUT);
@@ -694,6 +729,10 @@ void setup() {
     Serial.println("Fingerprint sensor ready.");
   }
 
+  // UART Communication setup
+  uartSerial.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX, UART_TX);
+  Serial.println("UART communication ready.");
+
   // WiFi + time
   initWiFi();
   if (wifiConnected) {
@@ -702,8 +741,10 @@ void setup() {
     Serial.println("WiFi not connected. Attempting later.");
   }
 
-  // ESP-NOW init
+  // ESP-NOW init (only if needed)
+  #if COMM_MODE == 0 || COMM_MODE == 2
   initializeESP_NOW();
+  #endif
 
   // Initial instruction (main with time)
   sendInstruction("main");

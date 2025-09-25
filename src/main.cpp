@@ -1,13 +1,11 @@
-/* Master — ESP32 (Optimized)
- * - Fingerprint (Adafruit_Fingerprint) with non-blocking operations
+/* Master — ESP32 (Non-blocking fingerprint + queued network)
+ * - Fingerprint (Adafruit_Fingerprint) with non-blocking state machines
  * - WiFi + NTP (WAT, UTC+1)
- * - Supabase REST calls with caching
- * - ESP-NOW for display communication
+ * - Supabase REST calls queued and processed asynchronously
  * - UART communication support
  */
 
 #include <Arduino.h>
-#include <esp_now.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -18,9 +16,6 @@
 #include <vector>
 
 // ---------------------- USER CONFIG ----------------------
-// Replace with your display/slave MAC (6 bytes)
-uint8_t receiverMAC[] = {0x78, 0xEE, 0x4C, 0x02, 0x17, 0x54};
-
 // WiFi
 const char* ssid     = "Skill G Innovation";
 const char* password = "INNOV8HUB";
@@ -46,11 +41,8 @@ const char* supabase_apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJz
 // Buzzer pin (optional)
 #define BUZZER_PIN 13
 
-// ESP-NOW send interval for main heartbeat/time update
+// UART send interval for main heartbeat/time update
 const unsigned long sendInterval = 7000; // 7 seconds
-
-// Communication mode: 0 = ESP-NOW only, 1 = UART only, 2 = Both
-#define COMM_MODE 2
 
 // ---------------------------------------------------------
 
@@ -67,23 +59,42 @@ HardwareSerial uartSerial(2);
 
 // State
 bool wifiConnected = false;
-bool espNowInitialized = false;
 unsigned long lastSendTime = 0;
 
 // control mode from Supabase: "collection" or "register"
 String mode = "collection";
 int staffidToRegister = -1;
 
-// Fingerprint state machine
+// Fingerprint state machine (collection)
 enum FingerprintState { IDLE, SCANNING, PROCESSING, COMPLETE };
 FingerprintState fpState = IDLE;
 unsigned long lastFpCheck = 0;
 const unsigned long fpCheckInterval = 100; // Check every 100ms
 
+// Enrollment state machine (non-blocking)
+enum EnrollStep {
+  ENROLL_IDLE = 0,
+  ENROLL_WAIT_FIRST,
+  ENROLL_FIRST_CAPTURED,
+  ENROLL_WAIT_REMOVE,
+  ENROLL_WAIT_SECOND,
+  ENROLL_SECOND_CAPTURED,
+  ENROLL_CREATE_MODEL,
+  ENROLL_STORE_MODEL,
+  ENROLL_DONE,
+  ENROLL_FAILED
+};
+EnrollStep enrollStep = ENROLL_IDLE;
+int enrollStaffId = -1;
+int enrollFid = -1;
+unsigned long enrollStartTime = 0;
+const unsigned long enrollTimeout = 30000; // 30s for each waiting phase
+unsigned long enrollStepTime = 0;
+
 // Collection cache
 std::vector<int> collectedToday;
 unsigned long lastCollectionRefresh = 0;
-const unsigned long collectionRefreshInterval = 60000; // Refresh every 60 seconds
+const unsigned long collectionRefreshInterval = 300000; // Refresh every 5 min
 
 // Timing variables
 unsigned long lastControlPoll = 0;
@@ -91,16 +102,17 @@ const unsigned long controlPollInterval = 5000; // Poll every 5 seconds
 unsigned long lastWifiAttempt = 0;
 const unsigned long wifiReconnectInterval = 30000; // Try reconnect every 30 seconds
 
+// Pending network log queue (non-blocking)
+std::vector<String> pendingLogs; // JSON payload strings
+
 // ---------- Forward declarations ----------
 void initWiFi();
 bool syncTimeWithNTP();
 String hhmmNow();
 String isoTimeNowWAT();
 String getTodayDate();
-bool initializeESP_NOW();
 void sendInstruction(const char* instruction);
 void sendInstructionWithTime(const char* instruction);
-void onSent(const uint8_t *mac_addr, esp_now_send_status_t status);
 void sendViaUART(const char* instruction, bool withTime = true);
 
 String checkControlMode();
@@ -113,20 +125,15 @@ int getStaffIdByFingerprint(int fid);
 bool hasCollectedToday(int staffid);
 void refreshCollectionCache();
 int findNextAvailableID();
-bool enrollFingerprintFlow(int staffid, unsigned long timeoutMs = 30000);
 void handleFingerprintOperations(unsigned long now);
-void handleCollectionMode();
-void processFingerprint();
-void handleRegistrationMode();
+void handleCollectionMode(unsigned long now);
+void startEnrollmentNonBlocking(int staffid);
+void handleEnrollmentNonBlocking(unsigned long now);
+void queueCollectionLog(int fid, int tag, int staffid);
+void handleNetworkOperations(unsigned long now);
+void sendPendingLogs();
 void successBeep();
 void errorBeep();
-void handleNetworkOperations(unsigned long now);
-
-// ------------------ ESP-NOW callback --------------------
-void onSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("ESP-NOW Send Status: ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
-}
 
 // ------------------ UART Communication --------------------
 void sendViaUART(const char* instruction, bool withTime) {
@@ -147,7 +154,7 @@ bool syncTimeWithNTP() {
   Serial.println("Syncing time with NTP...");
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   unsigned long start = millis();
-  while (millis() - start < 10000) { // 10s wait (reduced from 15s)
+  while (millis() - start < 10000) { // 10s wait
     struct tm timeinfo;
     if (getLocalTime(&timeinfo)) {
       Serial.println("NTP time obtained.");
@@ -166,7 +173,6 @@ bool syncTimeWithNTP() {
 String hhmmNow() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
-    // fallback to millis-based approximate
     time_t now = time(nullptr);
     localtime_r(&now, &timeinfo);
   }
@@ -179,7 +185,6 @@ String isoTimeNowWAT() {
   time_t now = time(nullptr);
   struct tm t; localtime_r(&now, &t);
   char tmp[32];
-  // create ISO like "2025-08-29T14:05:33+01:00"
   strftime(tmp, sizeof(tmp), "%Y-%m-%dT%H:%M:%S%z", &t); // e.g., +0100
   String s(tmp);
   if (s.length() >= 5) s = s.substring(0, s.length()-2) + ":" + s.substring(s.length()-2);
@@ -202,7 +207,7 @@ void initWiFi() {
   WiFi.begin(ssid, password);
   Serial.printf("Connecting to WiFi '%s' ...\n", ssid);
   unsigned long start = millis();
-  const unsigned long timeout = 20000; // 20s initial timeout (reduced from 30s)
+  const unsigned long timeout = 20000; // 20s initial timeout
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
     Serial.print(".");
     delay(500);
@@ -212,69 +217,21 @@ void initWiFi() {
     Serial.print("IP: "); Serial.println(WiFi.localIP());
     tlsClient.setInsecure();
     wifiConnected = true;
-    // Refresh collection cache on WiFi connect
-    refreshCollectionCache();
+    refreshCollectionCache(); // refresh immediately
   } else {
     Serial.println("\nWiFi connection failed.");
     wifiConnected = false;
   }
 }
 
-// ------------------ ESP-NOW init & send ----------------
-bool initializeESP_NOW() {
-  if (espNowInitialized) return true;
-
-  Serial.println("Initializing ESP-NOW...");
-  WiFi.mode(WIFI_STA);
-  Serial.print("MAC: "); Serial.println(WiFi.macAddress());
-
-  esp_err_t r = esp_now_init();
-  if (r != ESP_OK) {
-    Serial.printf("esp_now_init failed: 0x%X\n", r);
-    return false;
-  }
-  esp_now_register_send_cb(onSent);
-
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, receiverMAC, 6);
-  peer.channel = 0;
-  peer.encrypt = false;
-
-  r = esp_now_add_peer(&peer);
-  if (r != ESP_OK && r != ESP_ERR_ESPNOW_EXIST) {
-    Serial.printf("esp_now_add_peer failed: 0x%X\n", r);
-    // Not fatal — may still send if interface accepts raw send
-  } else {
-    Serial.println("ESP-NOW peer added.");
-  }
-
-  espNowInitialized = true;
-  return true;
-}
-
-// Builds "instruction|HH:MM" and sends via esp_now
+// Builds "instruction|HH:MM" and sends via UART
 void sendInstructionWithTime(const char* instruction) {
   String t = hhmmNow();
   char msg[64];
   snprintf(msg, sizeof(msg), "%s|%s", instruction, t.c_str());
   
-  // Send via selected communication method
-  #if COMM_MODE == 0 || COMM_MODE == 2
-  // ESP-NOW
-  if (!espNowInitialized) {
-    initializeESP_NOW();
-  }
-  esp_err_t r = esp_now_send(receiverMAC, (uint8_t*)msg, strlen(msg));
-  Serial.printf("ESP-NOW Sent: %s\n", msg);
-  if (r != ESP_OK) {
-    Serial.printf("esp_now_send error: 0x%X\n", r);
-  }
-  #endif
-  
-  #if COMM_MODE == 1 || COMM_MODE == 2
-  // UART
+  // Send via UART
   sendViaUART(instruction);
-  #endif
 }
 
 void sendInstruction(const char* instruction) {
@@ -348,8 +305,9 @@ void updateControlModeToCollection() {
   mode = "collection";
 }
 
-// ------------------ Supabase helpers --------------------
+// ------------------ Supabase helpers (used by non-blocking sender) --------------------
 bool staffExists(int staffid) {
+  if (WiFi.status() != WL_CONNECTED) return false;
   HTTPClient h;
   String url = String(supabase_url) + "/rest/v1/staff?staffid=eq." + String(staffid) + "&select=staffid&limit=1";
   if (!h.begin(tlsClient, url)) return false;
@@ -360,12 +318,14 @@ bool staffExists(int staffid) {
   h.end();
   if (code != 200) return false;
 
-  StaticJsonDocument<256> doc;
+  DynamicJsonDocument doc(256);
   if (deserializeJson(doc, payload)) return false;
   return doc.as<JsonArray>().size() > 0;
 }
 
+// NOTE: This is still synchronous; called from network worker (non-critical for fingerprint timing)
 bool updateStaffFingerprint(int staffid, int fid) {
+  if (WiFi.status() != WL_CONNECTED) return false;
   HTTPClient h;
   String url = String(supabase_url) + "/rest/v1/staff?staffid=eq." + String(staffid);
   if (!h.begin(tlsClient, url)) return false;
@@ -384,6 +344,7 @@ bool updateStaffFingerprint(int staffid, int fid) {
 }
 
 int getStaffIdByFingerprint(int fid) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
   HTTPClient h;
   String url = String(supabase_url) + "/rest/v1/staff?fingerprintid=eq." + String(fid) + "&select=staffid&limit=1";
   if (!h.begin(tlsClient, url)) return -1;
@@ -401,6 +362,7 @@ int getStaffIdByFingerprint(int fid) {
 }
 
 int getTagByFingerprint(int fid) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
   HTTPClient h;
   String url = String(supabase_url) + "/rest/v1/staff?fingerprintid=eq." + String(fid) + "&select=tag&limit=1";
   if (!h.begin(tlsClient, url)) return -1;
@@ -418,7 +380,6 @@ int getTagByFingerprint(int fid) {
 }
 
 bool hasCollectedToday(int staffid) {
-  // Check local cache first (much faster)
   for (int id : collectedToday) {
     if (id == staffid) {
       return true;
@@ -446,20 +407,25 @@ void refreshCollectionCache() {
   int code = h.GET();
   if (code == 200) {
     String payload = h.getString();
-    DynamicJsonDocument doc(2048);
-    if (!deserializeJson(doc, payload)) {
+    DynamicJsonDocument doc(4096);
+    auto err = deserializeJson(doc, payload);
+    if (!err) {
       for (JsonObject item : doc.as<JsonArray>()) {
         collectedToday.push_back(item["staffid"].as<int>());
       }
       Serial.printf("Collection cache refreshed: %d entries\n", collectedToday.size());
+    } else {
+      Serial.println("Collection cache parse error");
     }
+  } else {
+    Serial.printf("Collection cache refresh failed: %d\n", code);
   }
   
   h.end();
   lastCollectionRefresh = millis();
 }
 
-// ------------------ Fingerprint ops ----------------------
+// ------------------ Fingerprint ops (utilities) ----------------------
 int findNextAvailableID() {
   for (int id = 1; id <= 127; id++) {
     if (finger.loadModel(id) != FINGERPRINT_OK) {
@@ -469,214 +435,322 @@ int findNextAvailableID() {
   return -1;
 }
 
-// Enrollment: two scans, link to staff record in DB
-bool enrollFingerprintFlow(int staffid, unsigned long timeoutMs) {
-  if (!staffExists(staffid)) {
-    Serial.printf("Staff %d not found.\n", staffid);
-    return false;
-  }
-
-  int fid = findNextAvailableID();
-  if (fid < 0) { Serial.println("No free fingerprint slots."); return false; }
-
-  Serial.printf("Enroll staff %d -> fid %d\n", staffid, fid);
-
-  unsigned long start = millis();
-  uint8_t p;
-
-  // FIRST SCAN
-  sendInstruction("scan");
-  Serial.println("Place finger (first)...");
-  start = millis();
-  while ((p = finger.getImage()) != FINGERPRINT_OK) {
-    if (millis() - start > timeoutMs) { Serial.println("Timeout first scan."); return false; }
-    delay(50);
-  }
-  if (finger.image2Tz(1) != FINGERPRINT_OK) { Serial.println("image2Tz(1) failed"); return false; }
-  sendInstruction("successful"); successBeep();
-  delay(600);
-
-  // Wait remove
-  Serial.println("Remove finger...");
-  start = millis();
-  while (finger.getImage() != FINGERPRINT_NOFINGER) {
-    if (millis() - start > timeoutMs) { Serial.println("Timeout remove."); return false; }
-    delay(50);
-  }
-
-  // SECOND SCAN
-  sendInstruction("scan");
-  Serial.println("Place same finger (second)...");
-  start = millis();
-  while ((p = finger.getImage()) != FINGERPRINT_OK) {
-    if (millis() - start > timeoutMs) { Serial.println("Timeout second scan."); return false; }
-    delay(50);
-  }
-  if (finger.image2Tz(2) != FINGERPRINT_OK) { Serial.println("image2Tz(2) failed"); return false; }
-
-  if (finger.createModel() != FINGERPRINT_OK) { Serial.println("createModel mismatch."); return false; }
-  if (finger.storeModel(fid) != FINGERPRINT_OK) { Serial.println("storeModel failed."); return false; }
-
-  sendInstruction("successful"); successBeep();
-  Serial.println("Enrollment success, updating DB...");
-
-  if (!updateStaffFingerprint(staffid, fid)) {
-    Serial.println("DB link failed.");
-    errorBeep();
-    return false;
-  }
-
-  delay(800);
-  sendInstruction("main");
-  return true;
-}
-
-// ------------------ Fingerprint State Machine --------------------
-void handleFingerprintOperations(unsigned long now) {
-  if (now - lastFpCheck < fpCheckInterval) return;
-  lastFpCheck = now;
-  
-  if (mode == "register" && staffidToRegister > 0) {
-    handleRegistrationMode();
-  } else {
-    handleCollectionMode();
-  }
-}
-
-void handleCollectionMode() {
-  switch (fpState) {
-    case IDLE:
-      if (finger.getImage() == FINGERPRINT_OK) {
-        fpState = SCANNING;
-        sendInstruction("scan");
-        Serial.println("Finger detected, processing...");
-      }
-      break;
-      
-    case SCANNING:
-      processFingerprint();
-      break;
-      
-    case COMPLETE:
-      // Reset after completion
-      delay(800);
-      sendInstruction("main");
-      fpState = IDLE;
-      break;
-      
-    case PROCESSING:
-      // Processing in progress, do nothing
-      break;
-  }
-}
-
-void processFingerprint() {
-  fpState = PROCESSING;
-  
-  uint8_t p = finger.image2Tz();
-  if (p != FINGERPRINT_OK) {
-    Serial.printf("image2Tz error: %u\n", p);
-    errorBeep();
-    sendInstruction("unsuccessful");
-    fpState = COMPLETE;
-    return;
-  }
-
-  p = finger.fingerFastSearch();
-  if (p != FINGERPRINT_OK) {
-    Serial.println("No match.");
-    errorBeep();
-    sendInstruction("unsuccessful");
-    fpState = COMPLETE;
-    return;
-  }
-
-  int fid = finger.fingerID;
-  Serial.printf("Fingerprint match: fid=%d confidence=%d\n", fid, finger.confidence);
-
-  int tag = getTagByFingerprint(fid);
-  if (tag < 0) {
-    Serial.println("Fingerprint has no staff record (tag).");
-    errorBeep();
-    sendInstruction("unsuccessful");
-    fpState = COMPLETE;
-    return;
-  }
-
-  int staffid = getStaffIdByFingerprint(fid);
-  if (staffid < 0) {
-    Serial.println("No staffid for fingerprint.");
-    errorBeep();
-    sendInstruction("unsuccessful");
-    fpState = COMPLETE;
-    return;
-  }
-
-  if (hasCollectedToday(staffid)) {
-    Serial.printf("Staff %d already collected today.\n", staffid);
-    errorBeep();
-    sendInstruction("unsuccessful");
-    fpState = COMPLETE;
-    return;
-  }
-
-  // Log collection to Supabase
-  HTTPClient h;
-  String url = String(supabase_url) + "/rest/v1/food_collections";
-  if (!h.begin(tlsClient, url)) {
-    Serial.println("HTTP begin failed (log POST).");
-    errorBeep();
-    sendInstruction("unsuccessful");
-    fpState = COMPLETE;
-    return;
-  }
-  h.addHeader("apikey", supabase_apikey);
-  h.addHeader("Authorization", String("Bearer ") + supabase_apikey);
-  h.addHeader("Content-Type", "application/json");
-  h.addHeader("Prefer", "return=minimal");
-
-  String ts = isoTimeNowWAT();
+// Queue a collection log JSON payload for asynchronous sending
+void queueCollectionLog(int fid, int tag, int staffid) {
   StaticJsonDocument<256> body;
   body["fingerprintid"]  = fid;
   body["tag"]            = tag;
   body["staffid"]        = staffid;
-  body["time_collected"] = ts;
+  body["time_collected"] = isoTimeNowWAT();
   String payload; serializeJson(body, payload);
 
-  int code = h.POST(payload);
-  h.end();
-
-  if (code == HTTP_CODE_CREATED) {
-    Serial.printf("Collection logged: staff %d @ %s\n", staffid, ts.c_str());
-    successBeep();
-    sendInstruction("successful");
-    // Add to local cache
-    collectedToday.push_back(staffid);
-  } else {
-    Serial.printf("Log failed: %d\n", code);
-    errorBeep();
-    sendInstruction("unsuccessful");
-  }
-
-  fpState = COMPLETE;
+  pendingLogs.push_back(payload);
+  Serial.printf("Queued log for staff %d (fid %d). Pending logs: %d\n", staffid, fid, (int)pendingLogs.size());
 }
 
-void handleRegistrationMode() {
-  Serial.printf("Entering registration mode for staff %d\n", staffidToRegister);
-  sendInstruction("main"); // ensure UI stable before starting
-  bool ok = enrollFingerprintFlow(staffidToRegister, 30000);
-  if (!ok) {
-    Serial.println("Enrollment failed or timed out.");
-    errorBeep();
-    sendInstruction("unsuccessful");
-    delay(800);
-    sendInstruction("main");
+// ------------------ Fingerprint State Machine (non-blocking) --------------------
+void handleFingerprintOperations(unsigned long now) {
+  // run every fpCheckInterval
+  if (now - lastFpCheck < fpCheckInterval) return;
+  lastFpCheck = now;
+
+  // If register mode requested from server and we aren't already enrolling -> start enroll
+  if (mode == "register" && staffidToRegister > 0 && enrollStep == ENROLL_IDLE) {
+    startEnrollmentNonBlocking(staffidToRegister);
+    return; // enrollment will be handled in separate handler
   }
-  updateControlModeToCollection();
-  fpState = IDLE;
+
+  // If currently in enrollment flow, handle it
+  if (enrollStep != ENROLL_IDLE && enrollStep != ENROLL_DONE && enrollStep != ENROLL_FAILED) {
+    handleEnrollmentNonBlocking(now);
+    return;
+  }
+
+  // Otherwise handle collection mode
+  handleCollectionMode(now);
 }
 
-// ------------------ Network Operations --------------------
+void handleCollectionMode(unsigned long now) {
+  switch (fpState) {
+    case IDLE:
+      // check quickly for finger presence (non-blocking)
+      if (finger.getImage() == FINGERPRINT_OK) {
+        fpState = SCANNING;
+        sendInstruction("scan");
+        Serial.println("Finger detected - capture starting...");
+      }
+      break;
+
+    case SCANNING:
+      // Convert image to char buffer (non-blocking single check)
+      {
+        uint8_t p = finger.image2Tz(); // some Adafruit libs default to slot 1 here
+        if (p != FINGERPRINT_OK) {
+          Serial.printf("image2Tz error in collection: %u\n", p);
+          errorBeep();
+          sendInstruction("unsuccessful");
+          fpState = COMPLETE;
+          return;
+        }
+        fpState = PROCESSING;
+      }
+      break;
+
+    case PROCESSING:
+      // Search template
+      {
+        uint8_t p = finger.fingerFastSearch();
+        if (p != FINGERPRINT_OK) {
+          Serial.println("No match (collection).");
+          errorBeep();
+          sendInstruction("unsuccessful");
+          fpState = COMPLETE;
+          return;
+        }
+        int fid = finger.fingerID;
+        Serial.printf("Fingerprint match: fid=%d confidence=%d\n", fid, finger.confidence);
+
+        // Retrieve tag and staffid via network (these are synchronous operations; to avoid blocking the scanner
+        // we only enqueue the log and handle staff/tag retrieval in the network worker if desired).
+        // But getTagByFingerprint/getStaffIdByFingerprint use HTTPClient and will block if WiFi used.
+        // Instead, fetch tag/staffid only if WiFi is connected; otherwise mark as failure.
+        if (WiFi.status() != WL_CONNECTED) {
+          Serial.println("WiFi not connected — cannot verify staff. Queue unsuccessful.");
+          errorBeep();
+          sendInstruction("unsuccessful");
+          fpState = COMPLETE;
+          return;
+        }
+
+        int tag = getTagByFingerprint(fid);
+        if (tag < 0) {
+          Serial.println("Fingerprint has no staff record (tag).");
+          errorBeep();
+          sendInstruction("unsuccessful");
+          fpState = COMPLETE;
+          return;
+        }
+
+        int staffid = getStaffIdByFingerprint(fid);
+        if (staffid < 0) {
+          Serial.println("No staffid for fingerprint.");
+          errorBeep();
+          sendInstruction("unsuccessful");
+          fpState = COMPLETE;
+          return;
+        }
+
+        if (hasCollectedToday(staffid)) {
+          Serial.printf("Staff %d already collected today.\n", staffid);
+          errorBeep();
+          sendInstruction("unsuccessful");
+          fpState = COMPLETE;
+          return;
+        }
+
+        // Queue the log for asynchronous HTTP POST (non-blocking for scanner)
+        queueCollectionLog(fid, tag, staffid);
+
+        // Mark cached as collected immediately to avoid duplicate scans while queue is pending
+        collectedToday.push_back(staffid);
+
+        successBeep();
+        sendInstruction("successful");
+        fpState = COMPLETE;
+      }
+      break;
+
+    case COMPLETE:
+      // short non-blocking dwell, then go back to IDLE
+      static unsigned long completeStarted = 0;
+      if (completeStarted == 0) completeStarted = millis();
+      if (millis() - completeStarted >= 800) {
+        sendInstruction("main");
+        fpState = IDLE;
+        completeStarted = 0;
+      }
+      break;
+  }
+}
+
+// ------------------ Enrollment (non-blocking) --------------------
+void startEnrollmentNonBlocking(int staffid) {
+  // Start the non-blocking enrollment flow
+  if (!staffExists(staffid)) {
+    Serial.printf("Enrollment requested but staff %d does not exist.\n", staffid);
+    errorBeep();
+    sendInstruction("unsuccessful");
+    staffidToRegister = -1;
+    mode = "collection";
+    return;
+  }
+
+  enrollStaffId = staffid;
+  enrollFid = findNextAvailableID();
+  if (enrollFid < 0) {
+    Serial.println("No free fingerprint slots available.");
+    errorBeep();
+    sendInstruction("unsuccessful");
+    staffidToRegister = -1;
+    mode = "collection";
+    return;
+  }
+
+  enrollStep = ENROLL_WAIT_FIRST;
+  enrollStartTime = millis();
+  enrollStepTime = millis();
+  Serial.printf("Enroll start: staff %d -> fid %d\n", enrollStaffId, enrollFid);
+  sendInstruction("scan");
+  Serial.println("Place finger (first)...");
+}
+
+void handleEnrollmentNonBlocking(unsigned long now) {
+  switch (enrollStep) {
+    case ENROLL_WAIT_FIRST: {
+      // Wait until first capture is available or timeout
+      uint8_t p = finger.getImage();
+      if (p == FINGERPRINT_OK) {
+        // capture first
+        uint8_t r = finger.image2Tz(1); // buffer 1
+        if (r == FINGERPRINT_OK) {
+          enrollStep = ENROLL_FIRST_CAPTURED;
+          enrollStepTime = millis();
+          sendInstruction("successful"); successBeep();
+          Serial.println("First capture OK. Remove finger...");
+          // prepare to wait for finger removal
+          enrollStep = ENROLL_WAIT_REMOVE;
+          enrollStepTime = millis();
+        } else {
+          Serial.printf("image2Tz(1) failed: %u\n", r);
+          enrollStep = ENROLL_FAILED;
+        }
+      } else if (millis() - enrollStepTime > enrollTimeout) {
+        Serial.println("Timeout waiting for first finger.");
+        enrollStep = ENROLL_FAILED;
+      }
+      break;
+    }
+
+    case ENROLL_WAIT_REMOVE: {
+      // Wait until sensor reports NOFINGER
+      uint8_t p = finger.getImage();
+      if (p == FINGERPRINT_NOFINGER) {
+        Serial.println("Finger removed. Prompting for second scan...");
+        sendInstruction("scan");
+        enrollStep = ENROLL_WAIT_SECOND;
+        enrollStepTime = millis();
+      } else if (millis() - enrollStepTime > enrollTimeout) {
+        Serial.println("Timeout waiting for finger removal.");
+        enrollStep = ENROLL_FAILED;
+      }
+      break;
+    }
+
+    case ENROLL_WAIT_SECOND: {
+      uint8_t p = finger.getImage();
+      if (p == FINGERPRINT_OK) {
+        uint8_t r = finger.image2Tz(2); // buffer 2
+        if (r == FINGERPRINT_OK) {
+          enrollStep = ENROLL_SECOND_CAPTURED;
+          enrollStepTime = millis();
+          sendInstruction("successful"); successBeep();
+          Serial.println("Second capture OK. Creating model...");
+        } else {
+          Serial.printf("image2Tz(2) failed: %u\n", r);
+          enrollStep = ENROLL_FAILED;
+        }
+      } else if (millis() - enrollStepTime > enrollTimeout) {
+        Serial.println("Timeout waiting for second scan.");
+        enrollStep = ENROLL_FAILED;
+      }
+      break;
+    }
+
+    case ENROLL_SECOND_CAPTURED: {
+      // create model
+      uint8_t r = finger.createModel();
+      if (r == FINGERPRINT_OK) {
+        enrollStep = ENROLL_CREATE_MODEL;
+        Serial.println("Model created. Storing...");
+      } else {
+        Serial.printf("createModel failed: %u\n", r);
+        enrollStep = ENROLL_FAILED;
+      }
+      break;
+    }
+
+    case ENROLL_CREATE_MODEL: {
+      if (finger.storeModel(enrollFid) == FINGERPRINT_OK) {
+        enrollStep = ENROLL_STORE_MODEL;
+        Serial.printf("Stored model at slot %d\n", enrollFid);
+      } else {
+        Serial.println("storeModel failed.");
+        enrollStep = ENROLL_FAILED;
+      }
+      break;
+    }
+
+    case ENROLL_STORE_MODEL: {
+      // Update DB asynchronously: we will attempt now (network worker will succeed if WiFi ok).
+      // But to keep DB consistent faster, we try to call updateStaffFingerprint here (it's synchronous).
+      bool ok = false;
+      if (WiFi.status() == WL_CONNECTED) {
+        ok = updateStaffFingerprint(enrollStaffId, enrollFid);
+      } else {
+        ok = false;
+      }
+
+      if (!ok) {
+        Serial.println("DB link failed immediately. Scheduling retry via pendingLogs.");
+        // If DB update failed because of no WiFi or PATCH failure, queue a retry payload with special endpoint.
+        // We'll create a payload to indicate we need to update staff fingerprint later.
+        StaticJsonDocument<128> body;
+        body["op"] = "update_staff_fingerprint";
+        body["staffid"] = enrollStaffId;
+        body["fingerprintid"] = enrollFid;
+        String payload; serializeJson(body, payload);
+        pendingLogs.push_back(payload);
+      } else {
+        Serial.println("DB updated with fingerprint id.");
+      }
+
+      sendInstruction("successful");
+      successBeep();
+      enrollStep = ENROLL_DONE;
+      enrollStepTime = millis();
+      break;
+    }
+
+    case ENROLL_DONE: {
+      // Non-blocking post-enroll delay, then return to collection mode
+      if (millis() - enrollStepTime >= 800) {
+        sendInstruction("main");
+        enrollStep = ENROLL_IDLE;
+        staffidToRegister = -1;
+        mode = "collection";
+        enrollStaffId = -1;
+        enrollFid = -1;
+        Serial.println("Enrollment completed - returning to collection mode.");
+      }
+      break;
+    }
+
+    case ENROLL_FAILED: {
+      Serial.println("Enrollment failed. Sending unsuccessful and returning to collection mode.");
+      errorBeep();
+      sendInstruction("unsuccessful");
+      // small non-blocking wait
+      enrollStepTime = millis();
+      enrollStep = ENROLL_DONE; // route to DONE so main resets
+      break;
+    }
+
+    default:
+      break;
+  } // end switch
+}
+
+// ------------------ Network Operations (process queued logs) --------------------
 void handleNetworkOperations(unsigned long now) {
   // Check control mode every 5 seconds
   if (now - lastControlPoll >= controlPollInterval) {
@@ -684,19 +758,111 @@ void handleNetworkOperations(unsigned long now) {
     checkControlMode();
   }
   
-  // Refresh collection cache every minute
+  // Refresh collection cache every interval
   if (now - lastCollectionRefresh >= collectionRefreshInterval) {
     refreshCollectionCache();
   }
   
   // Handle WiFi reconnection
   if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiConnected) { wifiConnected = false; }
     if (now - lastWifiAttempt >= wifiReconnectInterval) {
       lastWifiAttempt = now;
       Serial.println("Attempting WiFi reconnect...");
       initWiFi();
     }
+  } else {
+    wifiConnected = true;
   }
+
+  // Try sending queued logs if connected
+  if (WiFi.status() == WL_CONNECTED && pendingLogs.size() > 0) {
+    sendPendingLogs();
+  }
+  
+  // Handle other periodic send (UART heartbeat)
+  if (now - lastSendTime >= sendInterval) {
+    lastSendTime = now;
+    sendInstruction("main");
+  }
+}
+
+// Send pending logs from pendingLogs vector. Each entry is either:
+// - A collection JSON to POST to /rest/v1/food_collections
+// - Or a special op like update_staff_fingerprint (we detect via JSON "op")
+void sendPendingLogs() {
+  // We'll iterate and attempt to send each; on success we remove it; on failure we keep for later.
+  for (int i = (int)pendingLogs.size() - 1; i >= 0; --i) {
+    String payload = pendingLogs[i];
+    DynamicJsonDocument doc(512);
+    DeserializationError err = deserializeJson(doc, payload);
+    if (err) {
+      // treat as regular collection entry if cannot parse (fallback)
+      Serial.println("Pending log parse error, attempting as collection payload.");
+      // attempt to post directly
+      HTTPClient h;
+      String url = String(supabase_url) + "/rest/v1/food_collections";
+      if (!h.begin(tlsClient, url)) {
+        Serial.println("HTTP begin failed for pending log.");
+        continue;
+      }
+      h.addHeader("apikey", supabase_apikey);
+      h.addHeader("Authorization", String("Bearer ") + supabase_apikey);
+      h.addHeader("Content-Type", "application/json");
+      h.addHeader("Prefer", "return=minimal");
+      int code = h.POST(payload);
+      h.end();
+      if (code == HTTP_CODE_CREATED) {
+        Serial.println("Pending collection posted successfully.");
+        pendingLogs.erase(pendingLogs.begin() + i);
+      } else {
+        Serial.printf("Pending collection post failed: %d\n", code);
+      }
+      continue;
+    }
+
+    // If parsed successfully, we can check for special op
+    if (doc.containsKey("op") && String((const char*)doc["op"]) == "update_staff_fingerprint") {
+      int staffid = doc["staffid"] | -1;
+      int fid = doc["fingerprintid"] | -1;
+      if (staffid > 0 && fid > 0) {
+        bool ok = updateStaffFingerprint(staffid, fid);
+        if (ok) {
+          Serial.printf("Deferred DB update applied for staff %d -> fid %d\n", staffid, fid);
+          pendingLogs.erase(pendingLogs.begin() + i);
+        } else {
+          Serial.println("Deferred DB update failed; will retry.");
+        }
+      } else {
+        Serial.println("Invalid deferred DB update payload; discarding.");
+        pendingLogs.erase(pendingLogs.begin() + i);
+      }
+      continue;
+    }
+
+    // Otherwise treat as collection log - post to /rest/v1/food_collections
+    HTTPClient h;
+    String url = String(supabase_url) + "/rest/v1/food_collections";
+    if (!h.begin(tlsClient, url)) {
+      Serial.println("HTTP begin failed for pending collection.");
+      continue;
+    }
+    h.addHeader("apikey", supabase_apikey);
+    h.addHeader("Authorization", String("Bearer ") + supabase_apikey);
+    h.addHeader("Content-Type", "application/json");
+    h.addHeader("Prefer", "return=minimal");
+    String out;
+    serializeJson(doc, out); // normalize payload
+    int code = h.POST(out);
+    h.end();
+    if (code == HTTP_CODE_CREATED) {
+      Serial.println("Pending collection posted successfully.");
+      pendingLogs.erase(pendingLogs.begin() + i);
+    } else {
+      Serial.printf("Pending collection post failed: %d\n", code);
+      // keep for retry
+    }
+  } // end for
 }
 
 // ------------------ Simple beeps -------------------------
@@ -714,7 +880,7 @@ void errorBeep() {
 
 // ------------------ Setup & Loop ------------------------
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   delay(100);
 
   pinMode(BUZZER_PIN, OUTPUT);
@@ -741,11 +907,6 @@ void setup() {
     Serial.println("WiFi not connected. Attempting later.");
   }
 
-  // ESP-NOW init (only if needed)
-  #if COMM_MODE == 0 || COMM_MODE == 2
-  initializeESP_NOW();
-  #endif
-
   // Initial instruction (main with time)
   sendInstruction("main");
 }
@@ -759,11 +920,6 @@ void loop() {
   // Handle fingerprint operations (non-blocking)
   handleFingerprintOperations(now);
   
-  // Handle ESP-NOW heartbeat
-  if (now - lastSendTime >= sendInterval) {
-    lastSendTime = now;
-    sendInstruction("main");
-  }
-  
-  delay(10); // Short yield
+  // tiny yield so background tasks and WiFi can run; avoids starving the system
+  delay(1);
 }

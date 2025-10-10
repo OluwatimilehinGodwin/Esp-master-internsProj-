@@ -1,5 +1,8 @@
 // Full revised sketch — optimized for real-time scanning and queued network work.
 // Target: ESP32
+// Changes: waits for server ACK on registration before switching back to main,
+// collection cache refresh = 30s, enrollment network-wait state + timeout.
+// Additional: registration takes priority, deferred control retry on timeout.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -11,6 +14,7 @@
 #include <Adafruit_Fingerprint.h>
 #include <vector>
 #include <map>
+#include <set>
 
 // ---------------------- USER CONFIG ----------------------
 // WiFi
@@ -41,9 +45,26 @@ const char* supabase_apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJz
 // Intervals
 const unsigned long sendInterval = 7000; // UART main heartbeat
 const unsigned long controlPollInterval = 5000;
-const unsigned long collectionRefreshInterval = 300000; // 5 min
+const unsigned long collectionRefreshInterval = 30000; // 30 seconds 
+
+// Scan cooldowns
+const unsigned long scanCooldownMs = 1200;        // after a complete scan, block new scans
+const unsigned long perFidCooldownMs = 2000;      // avoid processing same fid repeatedly
+
+// Enrollment network wait
+const unsigned long enrollNetworkMaxWait = 60000; // wait up to 60s for server ack
 
 // ---------------------------------------------------------
+
+// New globals for deferred control handling / enrollment scan timeout
+// Defer re-processing of a control row for some milliseconds after a timeout.
+// key = hashed control id (same hash used in checkControlModeNetwork), value = millis() when allowed again
+std::map<int, unsigned long> controlRetryTs;
+
+// Enrollment scan timeout (ms)
+const unsigned long enrollScanTimeout = 60000; // 60s before deferring/pausing enrollment
+// Defer duration for timed-out register rows
+const unsigned long controlRetryDelay = 60000; // 60s
 
 // Networking / clients (used only in network task)
 WiFiClientSecure tlsClient;
@@ -62,6 +83,7 @@ unsigned long lastSendTime = 0;
 // control mode from Supabase: "collection" or "register"
 String mode = "collection";
 int staffidToRegister = -1;
+int currentControlId = -1; // store control row id when a register command arrives
 
 // Fingerprint state machine (collection)
 enum FingerprintState { IDLE, SCANNING, PROCESSING, COMPLETE };
@@ -76,16 +98,16 @@ enum EnrollStep {
   ENROLL_WAIT_REMOVE,
   ENROLL_WAIT_SECOND,
   ENROLL_SECOND_CAPTURED,
-  ENROLL_CREATE_MODEL,
-  ENROLL_STORE_MODEL,
   ENROLL_DONE,
+  ENROLL_WAIT_NETWORK_ACK,
   ENROLL_FAILED
 };
 EnrollStep enrollStep = ENROLL_IDLE;
 int enrollStaffId = -1;
 int enrollFid = -1;
 unsigned long enrollStepTime = 0;
-const unsigned long enrollTimeout = 30000;
+unsigned long enrollNetworkStart = 0;
+bool enrollNetworkAck = false; // set by network task when server ack arrives
 
 // In-memory fingerprint map (fid -> {staffid, tag})
 struct FpRecord { int staffid; int tag; };
@@ -99,6 +121,12 @@ std::vector<String> pendingLogs; // JSON payloads to POST or deferred ops
 struct PendingResolve { int fid; unsigned long ts; };
 std::vector<PendingResolve> pendingResolves;
 
+// Aux sets to prevent duplicate payloads
+std::set<String> pendingHashes; // dedupe by payload string
+
+// track last processed time per fid to avoid duplicates & double messages
+std::map<int, unsigned long> lastProcessedFidTs;
+
 // Mutex for protecting shared structures
 SemaphoreHandle_t sharedMutex = NULL;
 
@@ -111,15 +139,13 @@ String getTodayDate();
 void successBeep();
 void errorBeep();
 
-// Network task
 void networkTask(void* pvParameters);
 
 // Utility (network-only) — run inside networkTask
 bool refreshFingerprintMap(); // loads fingerprintMap from server
 void refreshCollectionCache(); // loads collectedToday for today
 String checkControlModeNetwork(); // polls control mode from server
-bool sendOnePendingNetworkAction(); // processes one pending action (resolve or post)
-bool updateStaffFingerprintNetwork(int staffid, int fid);
+bool updateStaffFingerprintNetwork(int staffid, int fid, int controlId);
 
 // Enrollment helpers (main thread)
 int findNextAvailableID();
@@ -170,7 +196,7 @@ String getTodayDate() {
   return String(buf);
 }
 
-// Simple beeps - FIXED: moved preprocessor directives outside functions
+// Simple beeps
 #ifdef BUZZER_PIN
 void successBeep() { tone(BUZZER_PIN, 1000, 120); }
 void errorBeep()   { tone(BUZZER_PIN, 500, 250);  }
@@ -190,9 +216,12 @@ int findNextAvailableID() {
 }
 
 // ---------------- Fingerprint handling (main loop) ----------------
+unsigned long lastScanCompleteTs = 0;
+
 void handleCollectionMode(unsigned long now) {
   switch (fpState) {
     case IDLE:
+      if (now - lastScanCompleteTs < scanCooldownMs) return;
       if (finger.getImage() == FINGERPRINT_OK) {
         fpState = SCANNING;
         sendInstruction("scan");
@@ -225,7 +254,19 @@ void handleCollectionMode(unsigned long now) {
       int fid = finger.fingerID;
       Serial.printf("Fingerprint match: fid=%d confidence=%d\n", fid, finger.confidence);
 
-      // Try local lookup first (fast)
+      unsigned long lastTs = 0;
+      if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+        auto it = lastProcessedFidTs.find(fid);
+        if (it != lastProcessedFidTs.end()) lastTs = it->second;
+        xSemaphoreGive(sharedMutex);
+      }
+      if (millis() - lastTs < perFidCooldownMs) {
+        Serial.printf("Ignoring repeated fid %d within cooldown.\n", fid);
+        sendInstruction("main");
+        fpState = COMPLETE;
+        return;
+      }
+
       bool foundLocally = false;
       int staffid = -1, tag = -1;
       if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
@@ -235,15 +276,14 @@ void handleCollectionMode(unsigned long now) {
           staffid = it->second.staffid;
           tag = it->second.tag;
         }
+        lastProcessedFidTs[fid] = millis();
         xSemaphoreGive(sharedMutex);
       }
 
       if (foundLocally) {
-        // check if already collected today
         bool already = false;
         if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
           for (int id : collectedToday) if (id == staffid) { already = true; break; }
-          if (!already) collectedToday.push_back(staffid); // optimistic
           xSemaphoreGive(sharedMutex);
         }
 
@@ -255,7 +295,6 @@ void handleCollectionMode(unsigned long now) {
           return;
         }
 
-        // create payload and enqueue for network posting
         StaticJsonDocument<256> body;
         body["fingerprintid"] = fid;
         body["tag"] = tag;
@@ -263,20 +302,35 @@ void handleCollectionMode(unsigned long now) {
         body["time_collected"] = isoTimeNowWAT();
         String payload; serializeJson(body, payload);
 
+        bool willPush = false;
         if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
-          pendingLogs.push_back(payload); // network task will post ASAP
+          if (pendingHashes.find(payload) == pendingHashes.end()) {
+            pendingLogs.push_back(payload);
+            pendingHashes.insert(payload);
+            willPush = true;
+            collectedToday.push_back(staffid); // optimistic
+          } else {
+            Serial.println("Payload already queued, skipping duplicate enqueue.");
+          }
           xSemaphoreGive(sharedMutex);
         }
 
-        successBeep();
-        sendInstruction("successful"); // immediate positive feedback
+        if (willPush) {
+          successBeep();
+          sendInstruction("successful");
+        } else {
+          errorBeep();
+          sendInstruction("unsuccessful");
+        }
         fpState = COMPLETE;
         return;
       } else {
-        // not in local map — enqueue resolve and give "processing" UI so user knows it's working
         PendingResolve r; r.fid = fid; r.ts = millis();
         if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
-          pendingResolves.push_back(r);
+          bool already = false;
+          for (auto &pr : pendingResolves) if (pr.fid == fid) { already = true; break; }
+          if (!already) pendingResolves.push_back(r);
+          else Serial.printf("Resolve for fid %d already queued.\n", fid);
           xSemaphoreGive(sharedMutex);
         }
         sendInstruction("processing");
@@ -290,6 +344,7 @@ void handleCollectionMode(unsigned long now) {
       if (completeStarted == 0) completeStarted = millis();
       if (millis() - completeStarted >= 600) {
         sendInstruction("main");
+        lastScanCompleteTs = millis();
         fpState = IDLE;
         completeStarted = 0;
       }
@@ -299,21 +354,33 @@ void handleCollectionMode(unsigned long now) {
 }
 
 // ---------------- Enrollment (main thread nonblocking) ----------------
+// Modified to set mode under mutex and to integrate timeouts / deferral
 void startEnrollmentNonBlocking(int staffid) {
-  // To avoid blocking, we will start enrollment immediately (assume server sent valid staffid).
   enrollStaffId = staffid;
   enrollFid = findNextAvailableID();
   if (enrollFid < 0) {
     Serial.println("No free fingerprint slots available.");
     errorBeep();
     sendInstruction("unsuccessful");
-    staffidToRegister = -1;
-    mode = "collection";
+    if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+      staffidToRegister = -1;
+      mode = "collection";
+      currentControlId = -1;
+      xSemaphoreGive(sharedMutex);
+    }
     return;
+  }
+
+  // mark as active enrollment so network task will not replace mode
+  if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+    mode = "register";
+    staffidToRegister = staffid;
+    xSemaphoreGive(sharedMutex);
   }
 
   enrollStep = ENROLL_WAIT_FIRST;
   enrollStepTime = millis();
+  enrollNetworkAck = false;
   Serial.printf("Enroll start: staff %d -> fid %d\n", enrollStaffId, enrollFid);
   sendInstruction("scan");
 }
@@ -332,9 +399,21 @@ void handleEnrollmentNonBlocking(unsigned long now) {
           Serial.println("image2Tz(1) failed.");
           enrollStep = ENROLL_FAILED;
         }
-      } else if (millis() - enrollStepTime > enrollTimeout) {
-        Serial.println("Timeout waiting for first finger.");
-        enrollStep = ENROLL_FAILED;
+      } else if (millis() - enrollStepTime > enrollScanTimeout) {
+        Serial.println("Timeout waiting for first finger. Deferring registration and returning to collection.");
+        // defer reprocessing of this control row for controlRetryDelay
+        if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+          if (currentControlId > 0) controlRetryTs[currentControlId] = millis() + controlRetryDelay;
+          // reset UI state to collection
+          mode = "collection";
+          staffidToRegister = -1;
+          currentControlId = -1;
+          xSemaphoreGive(sharedMutex);
+        }
+        // reset enrollment locally
+        enrollStep = ENROLL_IDLE;
+        enrollStaffId = -1;
+        enrollFid = -1;
       }
       break;
     }
@@ -345,9 +424,18 @@ void handleEnrollmentNonBlocking(unsigned long now) {
         sendInstruction("scan");
         enrollStep = ENROLL_WAIT_SECOND;
         enrollStepTime = millis();
-      } else if (millis() - enrollStepTime > enrollTimeout) {
-        Serial.println("Timeout waiting for removal.");
-        enrollStep = ENROLL_FAILED;
+      } else if (millis() - enrollStepTime > enrollScanTimeout) {
+        Serial.println("Timeout waiting for removal. Deferring registration and returning to collection.");
+        if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+          if (currentControlId > 0) controlRetryTs[currentControlId] = millis() + controlRetryDelay;
+          mode = "collection";
+          staffidToRegister = -1;
+          currentControlId = -1;
+          xSemaphoreGive(sharedMutex);
+        }
+        enrollStep = ENROLL_IDLE;
+        enrollStaffId = -1;
+        enrollFid = -1;
       }
       break;
     }
@@ -362,9 +450,18 @@ void handleEnrollmentNonBlocking(unsigned long now) {
           Serial.println("image2Tz(2) failed.");
           enrollStep = ENROLL_FAILED;
         }
-      } else if (millis() - enrollStepTime > enrollTimeout) {
-        Serial.println("Timeout waiting for second scan.");
-        enrollStep = ENROLL_FAILED;
+      } else if (millis() - enrollStepTime > enrollScanTimeout) {
+        Serial.println("Timeout waiting for second scan. Deferring registration and returning to collection.");
+        if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+          if (currentControlId > 0) controlRetryTs[currentControlId] = millis() + controlRetryDelay;
+          mode = "collection";
+          staffidToRegister = -1;
+          currentControlId = -1;
+          xSemaphoreGive(sharedMutex);
+        }
+        enrollStep = ENROLL_IDLE;
+        enrollStaffId = -1;
+        enrollFid = -1;
       }
       break;
     }
@@ -374,19 +471,25 @@ void handleEnrollmentNonBlocking(unsigned long now) {
         Serial.println("Model created. Storing...");
         if (finger.storeModel(enrollFid) == FINGERPRINT_OK) {
           Serial.printf("Stored model at slot %d\n", enrollFid);
-          // Queue DB update for network task
-          StaticJsonDocument<128> body;
+          // Queue DB update for network task, include control id so network can mark processed
+          StaticJsonDocument<256> body;
           body["op"] = "update_staff_fingerprint";
           body["staffid"] = enrollStaffId;
           body["fingerprintid"] = enrollFid;
+          body["control_id"] = currentControlId; // might be -1 if unknown
           String payload; serializeJson(body, payload);
           if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
-            pendingLogs.push_back(payload);
+            if (pendingHashes.find(payload) == pendingHashes.end()) {
+              pendingLogs.push_back(payload);
+              pendingHashes.insert(payload);
+            }
             xSemaphoreGive(sharedMutex);
           }
           sendInstruction("successful"); successBeep();
-          enrollStep = ENROLL_DONE;
-          enrollStepTime = millis();
+          // go to WAIT_NETWORK_ACK: do not switch back to main until network confirms and marks control processed
+          enrollStep = ENROLL_WAIT_NETWORK_ACK;
+          enrollNetworkStart = millis();
+          Serial.println("Enrollment stored - waiting for network ACK to finalize registration...");
         } else {
           Serial.println("storeModel failed.");
           enrollStep = ENROLL_FAILED;
@@ -398,24 +501,56 @@ void handleEnrollmentNonBlocking(unsigned long now) {
       break;
     }
 
+    case ENROLL_WAIT_NETWORK_ACK: {
+      // If network ack arrives, finalize
+      if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+        if (enrollNetworkAck) {
+          // finalise locally
+          enrollNetworkAck = false;
+          enrollStep = ENROLL_DONE;
+        }
+        xSemaphoreGive(sharedMutex);
+      }
+      // timeout fallback for network ack (keep same behavior)
+      if (millis() - enrollNetworkStart > enrollNetworkMaxWait) {
+        Serial.println("Network ACK timeout; finalizing locally and returning to main. Pending DB op will be retried by network task.");
+        enrollStep = ENROLL_DONE;
+      }
+      break;
+    }
+
     case ENROLL_DONE: {
-      if (millis() - enrollStepTime >= 700) {
-        sendInstruction("main");
-        enrollStep = ENROLL_IDLE;
+      // Now safe to return to main UI (registration completed or timed out)
+      sendInstruction("main");
+      enrollStep = ENROLL_IDLE;
+      // sanitize/clear control registration state
+      if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
         staffidToRegister = -1;
         mode = "collection";
-        enrollStaffId = -1;
-        enrollFid = -1;
-        Serial.println("Enrollment done.");
+        currentControlId = -1;
+        xSemaphoreGive(sharedMutex);
       }
+      enrollStaffId = -1;
+      enrollFid = -1;
+      Serial.println("Enrollment done and device returned to collection mode.");
       break;
     }
 
     case ENROLL_FAILED: {
       errorBeep();
       sendInstruction("unsuccessful");
-      enrollStep = ENROLL_DONE;
-      enrollStepTime = millis();
+      // reset and return to collection (but do not mark control processed so it will be retried normally)
+      if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+        mode = "collection";
+        staffidToRegister = -1;
+        // optionally defer immediate pickup slightly to avoid flapping
+        if (currentControlId > 0) controlRetryTs[currentControlId] = millis() + controlRetryDelay;
+        currentControlId = -1;
+        xSemaphoreGive(sharedMutex);
+      }
+      enrollStep = ENROLL_IDLE;
+      enrollStaffId = -1;
+      enrollFid = -1;
       break;
     }
 
@@ -482,20 +617,21 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // Poll control mode only by reading mode variable (set by network task)
+  // Handle enrollment trigger
   if (mode == "register" && staffidToRegister > 0 && enrollStep == ENROLL_IDLE) {
+    Serial.println("Starting enrollment process...");
     startEnrollmentNonBlocking(staffidToRegister);
   }
 
   // Enrollment handling if active
-  if (enrollStep != ENROLL_IDLE && enrollStep != ENROLL_DONE && enrollStep != ENROLL_FAILED) {
+  if (enrollStep != ENROLL_IDLE) {
     handleEnrollmentNonBlocking(now);
-  }
-
-  // Fingerprint scanning (tight, non-blocking)
-  if (now - lastFpCheck >= fpCheckInterval) {
-    lastFpCheck = now;
-    handleCollectionMode(now);
+  } else {
+    // Only do collection scanning when not in enrollment
+    if (now - lastFpCheck >= fpCheckInterval) {
+      lastFpCheck = now;
+      handleCollectionMode(now);
+    }
   }
 
   // Heartbeat main message (non-blocking)
@@ -519,16 +655,19 @@ void networkTask(void* pvParameters) {
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
     refreshFingerprintMap();
+    checkControlModeNetwork();
     refreshCollectionCache();
     // sync time
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+    // IMMEDIATE control poll after initial refresh so new web "register" rows are detected quickly
+    checkControlModeNetwork();
   }
 
   for (;;) {
     // ensure WiFi
     if (WiFi.status() != WL_CONNECTED) {
       wifiConnected = false;
-      // Try reconnect periodically
       Serial.println("Network task: WiFi disconnected, attempting reconnect...");
       WiFi.disconnect(false);
       WiFi.reconnect();
@@ -541,7 +680,10 @@ void networkTask(void* pvParameters) {
         wifiConnected = true;
         // refresh caches quickly
         refreshFingerprintMap();
+        checkControlModeNetwork();
         refreshCollectionCache();
+        // immediate control poll to pick up any new register commands
+        checkControlModeNetwork();
       }
     }
 
@@ -550,19 +692,17 @@ void networkTask(void* pvParameters) {
     // Poll control mode every controlPollInterval
     if (now - lastControlPoll >= controlPollInterval) {
       lastControlPoll = now;
-      String newMode = checkControlModeNetwork();
-      if (newMode.length()) {
-        // newMode and staffidToRegister are set inside checkControlModeNetwork via shared mutex
-      }
+      checkControlModeNetwork();
     }
 
     // Refresh fingerprint mapping every 10 minutes (if connected)
     if (now - lastFingerprintRefresh >= 600000 && wifiConnected) {
       lastFingerprintRefresh = now;
       refreshFingerprintMap();
+      checkControlModeNetwork();
     }
 
-    // Refresh today's collection cache every collectionRefreshInterval
+    // Refresh today's collection cache every collectionRefreshInterval (30s)
     if (now - lastCollectionRefresh >= collectionRefreshInterval && wifiConnected) {
       lastCollectionRefresh = now;
       refreshCollectionCache();
@@ -571,139 +711,162 @@ void networkTask(void* pvParameters) {
     // Process one pending network action (resolve -> create collection -> POST) per loop
     if (wifiConnected) {
       bool didOne = false;
+
+      PendingResolve pr;
+      bool haveResolve = false;
       if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
         if (!pendingResolves.empty()) {
-          // pop front
-          PendingResolve pr = pendingResolves.front();
+          pr = pendingResolves.front();
           pendingResolves.erase(pendingResolves.begin());
-          xSemaphoreGive(sharedMutex);
+          haveResolve = true;
+        }
+        xSemaphoreGive(sharedMutex);
+      }
 
-          // Resolve fid -> tag/staffid by querying DB
-          int tag = -1, staffid = -1;
-          {
-            HTTPClient h;
-            String url = String(supabase_url) + "/rest/v1/staff?fingerprintid=eq." + String(pr.fid) + "&select=staffid,tag&limit=1";
-            if (h.begin(tlsClient, url)) {
-              h.addHeader("apikey", supabase_apikey);
-              h.addHeader("Authorization", String("Bearer ") + supabase_apikey);
-              int code = h.GET();
-              String payload = h.getString();
-              h.end();
-              if (code == 200) {
-                DynamicJsonDocument doc(512);
-                if (!deserializeJson(doc, payload) && doc.is<JsonArray>() && doc.size() > 0) {
-                  staffid = doc[0]["staffid"] | -1;
-                  tag = doc[0]["tag"] | -1;
-                }
+      if (haveResolve) {
+        int tag = -1, staffid = -1;
+        {
+          HTTPClient h;
+          String url = String(supabase_url) + "/rest/v1/staff?fingerprintid=eq." + String(pr.fid) + "&select=staffid,tag&limit=1";
+          if (h.begin(tlsClient, url)) {
+            h.addHeader("apikey", supabase_apikey);
+            h.addHeader("Authorization", String("Bearer ") + supabase_apikey);
+            int code = h.GET();
+            String payload = h.getString();
+            h.end();
+            if (code == 200) {
+              DynamicJsonDocument doc(512);
+              DeserializationError err = deserializeJson(doc, payload);
+              if (!err && doc.is<JsonArray>() && doc.size() > 0) {
+                staffid = doc[0]["staffid"] | -1;
+                tag = doc[0]["tag"] | -1;
               } else {
-                Serial.printf("Resolve GET failed: %d\n", code);
+                Serial.println("Resolve: parse error or no results");
               }
             } else {
-              Serial.println("Resolve HTTP begin failed");
+              Serial.printf("Resolve GET failed: %d\n", code);
             }
+          } else {
+            Serial.println("Resolve HTTP begin failed");
+          }
+        }
+
+        if (staffid <= 0 || tag < 0) {
+          errorBeep();
+          sendViaUART("unsuccessful", true);
+          didOne = true;
+        } else {
+          bool already = false;
+          if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+            for (int s : collectedToday) if (s == staffid) { already = true; break; }
+            if (!already) collectedToday.push_back(staffid);
+            xSemaphoreGive(sharedMutex);
           }
 
-          if (staffid <= 0 || tag < 0) {
-            // couldn't resolve — notify "unsuccessful" to device
+          if (already) {
             errorBeep();
             sendViaUART("unsuccessful", true);
-            didOne = true;
           } else {
-            // Check collectedToday cache: if not collected, enqueue collection POST
-            bool already = false;
+            StaticJsonDocument<256> body;
+            body["fingerprintid"] = pr.fid;
+            body["tag"] = tag;
+            body["staffid"] = staffid;
+            body["time_collected"] = isoTimeNowWAT();
+            String payload; serializeJson(body, payload);
+
             if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
-              for (int s : collectedToday) if (s == staffid) { already = true; break; }
-              if (!already) collectedToday.push_back(staffid);
+              if (pendingHashes.find(payload) == pendingHashes.end()) {
+                pendingLogs.push_back(payload);
+                pendingHashes.insert(payload);
+              } else {
+                Serial.println("Pending collection already queued (from resolve path).");
+              }
               xSemaphoreGive(sharedMutex);
             }
-
-            if (already) {
-              errorBeep();
-              sendViaUART("unsuccessful", true);
-            } else {
-              // create collection payload and push to pendingLogs head for immediate post
-              StaticJsonDocument<256> body;
-              body["fingerprintid"] = pr.fid;
-              body["tag"] = tag;
-              body["staffid"] = staffid;
-              body["time_collected"] = isoTimeNowWAT();
-              String payload; serializeJson(body, payload);
-              if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
-                pendingLogs.push_back(payload);
-                xSemaphoreGive(sharedMutex);
-              }
-              // Immediately send "successful" to device - final confirmation will happen after POST
-              successBeep();
-              sendViaUART("successful", true);
-            }
-            didOne = true;
+            successBeep();
+            sendViaUART("successful", true);
           }
-        } else if (!pendingLogs.empty()) {
-          // Pop first pendingLogs and POST it
-          String payload = pendingLogs.front();
-          // We must release mutex before doing HTTP
-          pendingLogs.erase(pendingLogs.begin());
+          didOne = true;
+        }
+      } else {
+        String payload;
+        bool havePayload = false;
+        if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+          if (!pendingLogs.empty()) {
+            payload = pendingLogs.front();
+            pendingLogs.erase(pendingLogs.begin());
+            havePayload = true;
+          }
           xSemaphoreGive(sharedMutex);
+        }
 
-          // Detect deferred ops (like update_staff_fingerprint)
+        if (havePayload) {
           DynamicJsonDocument doc(512);
-          if (!deserializeJson(doc, payload) && doc.containsKey("op") && String((const char*)doc["op"]) == "update_staff_fingerprint") {
-            int staffid = doc["staffid"] | -1;
-            int fid = doc["fingerprintid"] | -1;
-            bool ok = updateStaffFingerprintNetwork(staffid, fid);
-            if (!ok) {
-              // requeue for retry (put back end)
-              if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
-                pendingLogs.push_back(payload);
-                xSemaphoreGive(sharedMutex);
-              }
+          DeserializationError err = deserializeJson(doc, payload);
+          if (err) {
+            Serial.println("Pending payload parse error — removing from pendingHashes");
+            if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+              pendingHashes.erase(payload);
+              xSemaphoreGive(sharedMutex);
             }
             didOne = true;
           } else {
-            // Post to /food_collections
-            HTTPClient h;
-            String url = String(supabase_url) + "/rest/v1/food_collections";
-            if (h.begin(tlsClient, url)) {
-              h.addHeader("apikey", supabase_apikey);
-              h.addHeader("Authorization", String("Bearer ") + supabase_apikey);
-              h.addHeader("Content-Type", "application/json");
-              h.addHeader("Prefer", "return=minimal");
-              int code = h.POST(payload);
-              h.end();
-              if (code == HTTP_CODE_CREATED) {
-                Serial.println("Collection posted successfully.");
+            if (doc.containsKey("op") && String((const char*)doc["op"]) == "update_staff_fingerprint") {
+              int staffid = doc["staffid"] | -1;
+              int fid = doc["fingerprintid"] | -1;
+              int controlId = doc["control_id"] | -1;
+              bool ok = updateStaffFingerprintNetwork(staffid, fid, controlId);
+              if (!ok) {
+                if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+                  pendingLogs.push_back(payload);
+                  xSemaphoreGive(sharedMutex);
+                }
               } else {
-                Serial.printf("Collection POST failed: %d — will retry\n", code);
-                // requeue
+                // success -> remove from pendingHashes is handled in updateStaffFingerprintNetwork
+              }
+              didOne = true;
+            } else {
+              HTTPClient h;
+              String url = String(supabase_url) + "/rest/v1/food_collections";
+              if (h.begin(tlsClient, url)) {
+                h.addHeader("apikey", supabase_apikey);
+                h.addHeader("Authorization", String("Bearer ") + supabase_apikey);
+                h.addHeader("Content-Type", "application/json");
+                h.addHeader("Prefer", "return=minimal");
+                int code = h.POST(payload);
+                h.end();
+                if (code == HTTP_CODE_CREATED || code == 201) {
+                  Serial.println("Collection posted successfully.");
+                  if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdMS_TO_TICKS(10)) {
+                    pendingHashes.erase(payload);
+                    xSemaphoreGive(sharedMutex);
+                  }
+                } else {
+                  Serial.printf("Collection POST failed: %d — will retry\n", code);
+                  if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+                    pendingLogs.push_back(payload);
+                    xSemaphoreGive(sharedMutex);
+                  }
+                }
+              } else {
+                Serial.println("HTTP begin failed for collection; requeueing");
                 if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
                   pendingLogs.push_back(payload);
                   xSemaphoreGive(sharedMutex);
                 }
               }
-            } else {
-              Serial.println("HTTP begin failed for collection; requeueing");
-              if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
-                pendingLogs.push_back(payload);
-                xSemaphoreGive(sharedMutex);
-              }
+              didOne = true;
             }
-            didOne = true;
           }
-        } else {
-          xSemaphoreGive(sharedMutex); // nothing to do
         }
-      } else {
-        // couldn't get mutex; skip this cycle
       }
 
-      // If we did one network action, give a short delay so we don't hammer the server
       if (didOne) vTaskDelay(pdMS_TO_TICKS(150));
-      else vTaskDelay(pdMS_TO_TICKS(200)); // idle short wait
+      else vTaskDelay(pdMS_TO_TICKS(200));
     } else {
-      // Not connected: wait and try reconnect occasionally
       vTaskDelay(pdMS_TO_TICKS(1500));
     }
-  } // end for
+  }
 }
 
 // ---------- Network helper implementations (networkTask only) -------------
@@ -728,7 +891,7 @@ bool refreshFingerprintMap() {
   }
 
   DynamicJsonDocument doc(8192);
-  auto err = deserializeJson(doc, payload);
+  DeserializationError err = deserializeJson(doc, payload);
   if (err) {
     Serial.println("Fingerprint map parse error");
     return false;
@@ -773,7 +936,7 @@ void refreshCollectionCache() {
   }
 
   DynamicJsonDocument doc(4096);
-  auto err = deserializeJson(doc, payload);
+  DeserializationError err = deserializeJson(doc, payload);
   if (err) {
     Serial.println("Collection cache parse error");
     return;
@@ -790,10 +953,24 @@ void refreshCollectionCache() {
   Serial.printf("Collection cache refreshed: %d entries\n", (int)collectedToday.size());
 }
 
+// Modified: checkControlModeNetwork now skips deferred control rows and respects active enrollment
 String checkControlModeNetwork() {
   if (WiFi.status() != WL_CONNECTED) return String();
+
+  // If an enrollment is active on main thread, do not replace mode.
+  if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+    bool active = (enrollStep != ENROLL_IDLE);
+    xSemaphoreGive(sharedMutex);
+    if (active) {
+      // preserve current mode while enrollment in progress
+      Serial.println("checkControlModeNetwork: enrollment active — skipping control poll update.");
+      return mode;
+    }
+  }
+
   HTTPClient h;
-  String url = String(supabase_url) + "/rest/v1/control?select=mode,staffid&processed=eq.false&limit=1";
+  // include id so we can mark processed later
+  String url = String(supabase_url) + "/rest/v1/control?select=id,mode,staffid&processed=eq.false&limit=1";
   if (!h.begin(tlsClient, url)) {
     Serial.println("control GET begin failed");
     return String();
@@ -804,37 +981,95 @@ String checkControlModeNetwork() {
   int code = h.GET();
   String payload = h.getString();
   h.end();
-  if (code != 200) return String();
 
-  StaticJsonDocument<512> doc;
-  if (deserializeJson(doc, payload)) {
-    Serial.println("control parse error");
+  Serial.printf("control GET code=%d payload_len=%d\n", code, (int)payload.length());
+  if (payload.length() > 0) {
+    String pshort = payload;
+    if (pshort.length() > 512) pshort = pshort.substring(0, 512) + "...";
+    Serial.println("control payload (truncated):");
+    Serial.println(pshort);
+  }
+
+  if (code != 200) {
+    Serial.printf("control GET returned %d\n", code);
     return String();
   }
+
+  DynamicJsonDocument doc(2048);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("control parse error: ");
+    Serial.println(err.c_str());
+    return String();
+  }
+
   if (!doc.is<JsonArray>() || doc.size() == 0) {
     // default to collection
     if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
       mode = "collection";
       staffidToRegister = -1;
+      currentControlId = -1;
       xSemaphoreGive(sharedMutex);
     }
+    Serial.println("control: no pending rows -> remain in collection");
     return mode;
   }
+
   JsonObject first = doc[0];
   String newMode = String((const char*)(first["mode"] | "collection"));
   int sid = first["staffid"] | -1;
+  
+  // FIX: Handle UUID string for control ID
+  String controlIdStr = String((const char*)(first["id"] | ""));
+  int cid = -1;
+  if (controlIdStr.length() > 0) {
+    // Store as string or hash it to an integer - we'll use a simple hash
+    unsigned long hash = 0;
+    for (size_t i = 0; i < controlIdStr.length(); i++) {
+      hash = hash * 31 + controlIdStr.charAt(i);
+    }
+    cid = (int)(hash & 0x7FFFFFFF); // Ensure positive
+  }
+
+  unsigned long now = millis();
+  // Check if this control has a retry timestamp in future; if so ignore it for now
+  if (cid > 0) {
+    if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+      auto it = controlRetryTs.find(cid);
+      if (it != controlRetryTs.end() && now < it->second) {
+        // skip this control now (it is deferred)
+        Serial.printf("control %s (hashed %d) is deferred until +%lu ms -> ignoring for now\n",
+                      controlIdStr.c_str(), cid, it->second);
+        xSemaphoreGive(sharedMutex);
+        // treat as no pending rows -> remain collection
+        if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+          mode = "collection";
+          staffidToRegister = -1;
+          currentControlId = -1;
+          xSemaphoreGive(sharedMutex);
+        }
+        return mode;
+      }
+      xSemaphoreGive(sharedMutex);
+    }
+  }
 
   if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
     mode = newMode;
     staffidToRegister = sid;
+    currentControlId = cid;
     xSemaphoreGive(sharedMutex);
   }
-  Serial.printf("Control → mode=%s, staffid=%d\n", newMode.c_str(), sid);
+  Serial.printf("Control → mode=%s, staffid=%d, control_id=%d (from %s)\n", newMode.c_str(), sid, cid, controlIdStr.c_str());
   return newMode;
 }
 
-bool updateStaffFingerprintNetwork(int staffid, int fid) {
+// Update staff fingerprint and then mark control processed if controlId provided.
+// returns true if update + control patch (if needed) succeeded.
+bool updateStaffFingerprintNetwork(int staffid, int fid, int controlId) {
   if (WiFi.status() != WL_CONNECTED) return false;
+  
+  // Update staff fingerprint first
   HTTPClient h;
   String url = String(supabase_url) + "/rest/v1/staff?staffid=eq." + String(staffid);
   if (!h.begin(tlsClient, url)) {
@@ -852,13 +1087,50 @@ bool updateStaffFingerprintNetwork(int staffid, int fid) {
 
   int code = h.PATCH(out);
   h.end();
+  
   if (code == HTTP_CODE_NO_CONTENT || code == HTTP_CODE_OK) {
-    // Add to local fingerprint map quickly (so the new enrollment is usable immediately)
+    // Update local fingerprint map
     if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
-      fingerprintMap[fid] = { staffid, -1 }; // tag may be null/unknown; refresh map later
+      fingerprintMap[fid] = { staffid, -1 };
       xSemaphoreGive(sharedMutex);
     }
     Serial.printf("updateStaffFingerprint succeeded for staff %d -> fid %d\n", staffid, fid);
+
+    // Mark control as processed if we have a valid controlId
+    if (controlId > 0) {
+      // Since we hashed the UUID, we need to find the control row by staffid and mode
+      // This is a workaround since we can't directly query by the original UUID
+      HTTPClient h2;
+      String url2 = String(supabase_url) + "/rest/v1/control?mode=eq.register&staffid=eq." + String(staffid) + "&processed=eq.false";
+      if (!h2.begin(tlsClient, url2)) {
+        Serial.println("mark control processed begin failed");
+      } else {
+        h2.addHeader("apikey", supabase_apikey);
+        h2.addHeader("Authorization", String("Bearer ") + supabase_apikey);
+        h2.addHeader("Content-Type", "application/json");
+        h2.addHeader("Prefer", "return=minimal");
+        
+        StaticJsonDocument<64> b2;
+        b2["processed"] = true;
+        String out2; serializeJson(b2, out2);
+        
+        int code2 = h2.PATCH(out2);
+        h2.end();
+        
+        if (code2 == HTTP_CODE_NO_CONTENT || code2 == HTTP_CODE_OK) {
+          Serial.printf("Control marked processed for staff %d\n", staffid);
+        } else {
+          Serial.printf("Failed to mark control processed: %d\n", code2);
+        }
+      }
+    }
+
+    // Set network ACK to allow enrollment to complete
+    if (xSemaphoreTake(sharedMutex, (TickType_t)10/portTICK_PERIOD_MS) == pdTRUE) {
+      enrollNetworkAck = true;
+      xSemaphoreGive(sharedMutex);
+    }
+
     return true;
   } else {
     Serial.printf("updateStaffFingerprint failed: %d\n", code);
